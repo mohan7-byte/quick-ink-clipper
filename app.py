@@ -13,6 +13,13 @@ import tkinter as tk
 from tkinter import ttk, colorchooser
 import pystray
 
+# Enable High-DPI Awareness on Windows so widgets render sharply and don't paint black
+try:
+    from ctypes import windll
+    windll.shcore.SetProcessDpiAwareness(1)
+except Exception:
+    pass
+
 # ==========================================
 # CONFIGURATION & SETTINGS STORAGE
 # ==========================================
@@ -49,6 +56,7 @@ def save_settings(settings):
         print("Failed to save settings:", e)
 
 current_settings = load_settings()
+request_show_window = False
 
 # ==========================================
 # MATHEMATICAL MATTING ENGINE
@@ -130,7 +138,6 @@ def process_image(pil_img, cfg):
 last_processed_hash = None
 
 def get_clipboard_image():
-    """Safely retrieves an image from clipboard."""
     try:
         img = ImageGrab.grabclipboard()
         if isinstance(img, Image.Image):
@@ -140,7 +147,6 @@ def get_clipboard_image():
     return None
 
 def write_png_to_clipboard(pil_img):
-    """Pushes a raw transparent PNG directly into Windows Clipboard."""
     global last_processed_hash
     buf = io.BytesIO()
     pil_img.save(buf, format="PNG")
@@ -162,7 +168,7 @@ def write_png_to_clipboard(pil_img):
     return False
 
 # ==========================================
-# BACKGROUND LISTENER THREAD
+# BACKGROUND CLIPBOARD LISTENER THREAD
 # ==========================================
 def clipboard_listener():
     global last_processed_hash
@@ -181,12 +187,10 @@ def clipboard_listener():
         except Exception:
             continue
 
-        # Check if new content is an image
         img = get_clipboard_image()
         if img is None:
             continue
 
-        # Fingerprint current clipboard content
         try:
             raw_bytes = img.tobytes()
             current_hash = hashlib.md5(raw_bytes).hexdigest()
@@ -196,13 +200,11 @@ def clipboard_listener():
         if current_hash == last_processed_hash:
             continue  # Ignore our own export
 
-        # Safety Check: If image is already largely transparent, don't re-process
         if img.mode == "RGBA":
             alpha_channel = np.array(img)[:, :, 3]
             if np.mean(alpha_channel < 10) > 0.08:
                 continue
 
-        # Execute processing
         try:
             clean_png = process_image(img, current_settings)
             success = write_png_to_clipboard(clean_png)
@@ -225,12 +227,13 @@ def setup_tray(app):
     icon_image = create_tray_icon()
 
     def on_open(icon, item):
-        app.root.after(0, app.show_window)
+        global request_show_window
+        request_show_window = True
 
     def on_toggle_clip(icon, item):
         current_settings["auto_clip_enabled"] = not current_settings["auto_clip_enabled"]
         save_settings(current_settings)
-        app.root.after(0, app.sync_ui)
+        app.sync_ui()
 
     def on_exit(icon, item):
         icon.stop()
@@ -247,132 +250,157 @@ def setup_tray(app):
     return tray
 
 # ==========================================
-# SETTINGS GUI (Apple / Minimalist Style)
+# SETTINGS GUI (Robust, High-Contrast UI)
 # ==========================================
 class SettingsApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Quick Ink Clipper")
-        self.root.geometry("420x540")
-        self.root.resizable(False, False)
-        self.root.configure(bg="#0E1017")
+        self.root.geometry("440x600")
+        self.root.minsize(400, 520)
+        self.root.configure(bg="#111318")
 
-        # Intercept Close Button -> Hide to Tray
+        self.center_window(440, 600)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
         self.build_ui()
         self.sync_ui()
 
+        # Start continuous 50ms heartbeat poll loop
+        self.poll_tray_requests()
+
+    def center_window(self, w, h):
+        try:
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            x = max(0, (sw - w) // 2)
+            y = max(0, (sh - h) // 2)
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+
+    def poll_tray_requests(self):
+        global request_show_window
+        if request_show_window:
+            request_show_window = False
+            self.show_window()
+        self.root.after(50, self.poll_tray_requests)
+
     def build_ui(self):
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("TLabel", background="#0E1017", foreground="#F8FAFC", font=("Segoe UI", 9))
-        style.configure("Header.TLabel", font=("Segoe UI", 12, "bold"), foreground="#FFFFFF")
-        style.configure("Status.TLabel", font=("Segoe UI", 9, "bold"))
-        style.configure("Card.TFrame", background="#161822")
+        # Outer Container with bright, clear borders
+        self.container = tk.Frame(self.root, bg="#111318", padx=16, pady=16)
+        self.container.pack(fill="both", expand=True)
 
-        container = tk.Frame(self.root, bg="#0E1017", padx=20, pady=20)
-        container.pack(fill="both", expand=True)
+        # Header Title
+        header_frame = tk.Frame(self.container, bg="#111318")
+        header_frame.pack(fill="x", pady=(0, 12))
 
-        # Header Banner
-        header_frame = tk.Frame(container, bg="#0E1017")
-        header_frame.pack(fill="x", pady=(0, 16))
+        tk.Label(
+            header_frame, text="Quick Ink Clipper",
+            font=("Segoe UI", 14, "bold"), bg="#111318", fg="#FFFFFF"
+        ).pack(anchor="w")
 
-        tk.Label(header_frame, text="Quick Ink Clipper", font=("Segoe UI", 13, "bold"), bg="#0E1017", fg="#FFFFFF").pack(anchor="w")
-        self.status_lbl = tk.Label(header_frame, text="● Active & Monitoring", font=("Segoe UI", 8, "bold"), bg="#0E1017", fg="#10B981")
+        self.status_lbl = tk.Label(
+            header_frame, text="● Active & Monitoring (Win + Shift + S)",
+            font=("Segoe UI", 9, "bold"), bg="#111318", fg="#10B981"
+        )
         self.status_lbl.pack(anchor="w", pady=(2, 0))
 
-        # Main Toggle Card
-        toggle_card = tk.Frame(container, bg="#161822", padx=14, pady=12, highlightthickness=1, highlightbackground="#242838")
-        toggle_card.pack(fill="x", pady=(0, 12))
+        # Card 1: Master Controls
+        card1 = tk.Frame(self.container, bg="#1A1D26", padx=14, pady=12, relief="solid", bd=1, highlightbackground="#2D3345")
+        card1.pack(fill="x", pady=(0, 10))
 
         self.auto_clip_var = tk.BooleanVar(value=current_settings["auto_clip_enabled"])
         chk_clip = tk.Checkbutton(
-            toggle_card, text="Auto-Clip on Snip (Win + Shift + S)",
+            card1, text="Auto-Clip on Snip (Win + Shift + S)",
             variable=self.auto_clip_var, command=self.on_setting_change,
-            bg="#161822", fg="#FFFFFF", selectcolor="#0E1017", activebackground="#161822", activeforeground="#FFFFFF",
+            bg="#1A1D26", fg="#FFFFFF", selectcolor="#111318", activebackground="#1A1D26", activeforeground="#FFFFFF",
             font=("Segoe UI", 9, "bold")
         )
         chk_clip.pack(anchor="w")
 
         self.sound_var = tk.BooleanVar(value=current_settings["play_sound"])
         chk_sound = tk.Checkbutton(
-            toggle_card, text="Play audio chime when ready",
+            card1, text="Play audio chime when ready",
             variable=self.sound_var, command=self.on_setting_change,
-            bg="#161822", fg="#94A3B8", selectcolor="#0E1017", activebackground="#161822", activeforeground="#FFFFFF",
+            bg="#1A1D26", fg="#94A3B8", selectcolor="#111318", activebackground="#1A1D26", activeforeground="#FFFFFF",
             font=("Segoe UI", 8)
         )
         chk_sound.pack(anchor="w", pady=(4, 0))
 
-        # Ink Output Mode
-        mode_card = tk.Frame(container, bg="#161822", padx=14, pady=12, highlightthickness=1, highlightbackground="#242838")
-        mode_card.pack(fill="x", pady=(0, 12))
+        # Card 2: Ink Output Mode
+        card2 = tk.Frame(self.container, bg="#1A1D26", padx=14, pady=12, relief="solid", bd=1, highlightbackground="#2D3345")
+        card2.pack(fill="x", pady=(0, 10))
 
-        tk.Label(mode_card, text="RENDER INK AS", font=("Segoe UI", 8, "bold"), bg="#161822", fg="#94A3B8").pack(anchor="w", pady=(0, 8))
+        tk.Label(
+            card2, text="RENDER INK AS", font=("Segoe UI", 8, "bold"),
+            bg="#1A1D26", fg="#818CF8"
+        ).pack(anchor="w", pady=(0, 6))
 
         self.ink_mode_var = tk.StringVar(value=current_settings["ink_mode"])
         modes = [
             ("Pitch Black (Vector Sharp)", "black"),
             ("Preserve Tint (Keep Grey Rivers / Colors)", "preserve"),
-            ("Crisp White (For Dark Notes)", "white"),
-            ("Custom Color", "custom")
+            ("Crisp White (For Dark Notes)", "white")
         ]
         for label, val in modes:
             rb = tk.Radiobutton(
-                mode_card, text=label, value=val, variable=self.ink_mode_var,
-                command=self.on_setting_change, bg="#161822", fg="#E2E8F0",
-                selectcolor="#0E1017", activebackground="#161822", activeforeground="#FFFFFF",
+                card2, text=label, value=val, variable=self.ink_mode_var,
+                command=self.on_setting_change, bg="#1A1D26", fg="#E2E8F0",
+                selectcolor="#111318", activebackground="#1A1D26", activeforeground="#FFFFFF",
                 font=("Segoe UI", 8)
             )
             rb.pack(anchor="w", pady=2)
 
-        # Fine Tuning Sliders
-        tune_card = tk.Frame(container, bg="#161822", padx=14, pady=12, highlightthickness=1, highlightbackground="#242838")
-        tune_card.pack(fill="x", pady=(0, 12))
+        # Card 3: Precision Tuning Sliders
+        card3 = tk.Frame(self.container, bg="#1A1D26", padx=14, pady=12, relief="solid", bd=1, highlightbackground="#2D3345")
+        card3.pack(fill="x", pady=(0, 10))
 
-        # Slider 1: Tolerance
-        lbl_f1 = tk.Frame(tune_card, bg="#161822")
-        lbl_f1.pack(fill="x")
-        tk.Label(lbl_f1, text="White Background Cutoff", font=("Segoe UI", 8), bg="#161822", fg="#94A3B8").pack(side="left")
-        self.tol_val_lbl = tk.Label(lbl_f1, text=f"{current_settings['white_tolerance']}%", font=("Segoe UI", 8), bg="#161822", fg="#FFFFFF")
+        # Slider: Tolerance
+        f_tol = tk.Frame(card3, bg="#1A1D26")
+        f_tol.pack(fill="x")
+        tk.Label(f_tol, text="White Background Cutoff", font=("Segoe UI", 8), bg="#1A1D26", fg="#CBD5E1").pack(side="left")
+        self.tol_val_lbl = tk.Label(f_tol, text=f"{current_settings['white_tolerance']}%", font=("Segoe UI", 8, "bold"), bg="#1A1D26", fg="#38BDF8")
         self.tol_val_lbl.pack(side="right")
 
         self.tol_scale = tk.Scale(
-            tune_card, from_=10, to=80, orient="horizontal", bg="#161822", fg="#FFFFFF",
-            highlightthickness=0, troughcolor="#242838", showvalue=0, command=self.on_slider_change
+            card3, from_=10, to=80, orient="horizontal", bg="#1A1D26", fg="#FFFFFF",
+            highlightthickness=0, troughcolor="#2D3345", showvalue=0, command=self.on_slider_change
         )
         self.tol_scale.set(current_settings["white_tolerance"])
-        self.tol_scale.pack(fill="x", pady=(2, 8))
+        self.tol_scale.pack(fill="x", pady=(2, 6))
 
-        # Slider 2: Softness
-        lbl_f2 = tk.Frame(tune_card, bg="#161822")
-        lbl_f2.pack(fill="x")
-        tk.Label(lbl_f2, text="Edge Softness (Defringe)", font=("Segoe UI", 8), bg="#161822", fg="#94A3B8").pack(side="left")
-        self.soft_val_lbl = tk.Label(lbl_f2, text=f"{current_settings['softness']}px", font=("Segoe UI", 8), bg="#161822", fg="#FFFFFF")
+        # Slider: Softness
+        f_soft = tk.Frame(card3, bg="#1A1D26")
+        f_soft.pack(fill="x")
+        tk.Label(f_soft, text="Edge Softness (Defringe)", font=("Segoe UI", 8), bg="#1A1D26", fg="#CBD5E1").pack(side="left")
+        self.soft_val_lbl = tk.Label(f_soft, text=f"{current_settings['softness']}px", font=("Segoe UI", 8, "bold"), bg="#1A1D26", fg="#38BDF8")
         self.soft_val_lbl.pack(side="right")
 
         self.soft_scale = tk.Scale(
-            tune_card, from_=0, to=12, orient="horizontal", bg="#161822", fg="#FFFFFF",
-            highlightthickness=0, troughcolor="#242838", showvalue=0, command=self.on_slider_change
+            card3, from_=0, to=12, orient="horizontal", bg="#1A1D26", fg="#FFFFFF",
+            highlightthickness=0, troughcolor="#2D3345", showvalue=0, command=self.on_slider_change
         )
         self.soft_scale.set(current_settings["softness"])
         self.soft_scale.pack(fill="x", pady=(2, 6))
 
-        # Auto Crop Checkbox
+        # Checkbox: Auto Crop
         self.crop_var = tk.BooleanVar(value=current_settings["auto_crop"])
         chk_crop = tk.Checkbutton(
-            tune_card, text="Auto-Trim Empty Margins (Tight Sticker)",
+            card3, text="Auto-Trim Empty Margins (Tight Sticker)",
             variable=self.crop_var, command=self.on_setting_change,
-            bg="#161822", fg="#E2E8F0", selectcolor="#0E1017", activebackground="#161822", activeforeground="#FFFFFF",
+            bg="#1A1D26", fg="#E2E8F0", selectcolor="#111318", activebackground="#1A1D26", activeforeground="#FFFFFF",
             font=("Segoe UI", 8)
         )
         chk_crop.pack(anchor="w", pady=(4, 0))
 
-        # Minimize Hint
-        tk.Label(
-            container, text="Closing this window minimizes it to the Taskbar Tray.",
-            font=("Segoe UI", 8), bg="#0E1017", fg="#64748B"
-        ).pack(side="bottom")
+        # Hide to Tray Action Button
+        btn_hide = tk.Button(
+            self.container, text="✓ Save & Minimize to Taskbar Tray", command=self.hide_window,
+            bg="#2563EB", fg="#FFFFFF", activebackground="#1D4ED8", activeforeground="#FFFFFF",
+            relief="flat", font=("Segoe UI", 9, "bold"), pady=8, cursor="hand2"
+        )
+        btn_hide.pack(fill="x", pady=(6, 0))
 
     def on_setting_change(self):
         current_settings["auto_clip_enabled"] = self.auto_clip_var.get()
@@ -382,11 +410,15 @@ class SettingsApp:
         save_settings(current_settings)
         self.sync_ui()
 
-    def on_slider_change(self, _):
+    def on_slider_change(self, _=None):
+        if not hasattr(self, 'tol_scale') or not hasattr(self, 'soft_scale'):
+            return
         current_settings["white_tolerance"] = self.tol_scale.get()
         current_settings["softness"] = self.soft_scale.get()
-        self.tol_val_lbl.config(text=f"{self.tol_scale.get()}%")
-        self.soft_val_lbl.config(text=f"{self.soft_scale.get()}px")
+        if hasattr(self, 'tol_val_lbl'):
+            self.tol_val_lbl.config(text=f"{self.tol_scale.get()}%")
+        if hasattr(self, 'soft_val_lbl'):
+            self.soft_val_lbl.config(text=f"{self.soft_scale.get()}px")
         save_settings(current_settings)
 
     def sync_ui(self):
@@ -401,19 +433,25 @@ class SettingsApp:
 
     def show_window(self):
         self.root.deiconify()
+        self.root.state('normal')
         self.root.lift()
         self.root.focus_force()
+        # Force Windows to repaint the window canvas and children immediately
+        self.root.update_idletasks()
+        self.root.update()
 
 # ==========================================
 # MAIN ENTRY POINT
 # ==========================================
 if __name__ == "__main__":
-    # Start Clipboard Listener in background
     listener_thread = threading.Thread(target=clipboard_listener, daemon=True)
     listener_thread.start()
 
-    # Launch GUI
     root = tk.Tk()
     app = SettingsApp(root)
     setup_tray(app)
+
+    # Force initial display
+    app.show_window()
+
     root.mainloop()
