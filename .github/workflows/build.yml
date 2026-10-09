@@ -1,0 +1,36 @@
+name: Build Standalone Windows EXE
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile Standalone EXE
+        run: |
+          pyinstaller --noconsole --onefile --clean --name "QuickInkClipper" app.py
+
+      - name: Upload EXE as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuickInkClipper-Windows
+          path: dist/QuickInkClipper.exe
+          retention-days: 30
