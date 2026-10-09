@@ -13,7 +13,7 @@ import tkinter as tk
 from tkinter import ttk, colorchooser
 import pystray
 
-# Enable High-DPI Awareness on Windows so widgets render sharply and don't paint black
+# Windows High-DPI Awareness (Fixes blurry fonts & black-screen paint bugs)
 try:
     from ctypes import windll
     windll.shcore.SetProcessDpiAwareness(1)
@@ -21,7 +21,7 @@ except Exception:
     pass
 
 # ==========================================
-# CONFIGURATION & SETTINGS STORAGE
+# CONFIGURATION & PERSISTENT STORAGE
 # ==========================================
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", "."), "QuickInkClipper")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "settings.json")
@@ -29,11 +29,12 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "settings.json")
 DEFAULT_SETTINGS = {
     "auto_clip_enabled": True,
     "play_sound": True,
-    "ink_mode": "black",  # "black", "preserve", "white", "custom"
+    "bg_detection_mode": "auto",  # "auto", "white", "dark"
+    "ink_mode": "black",          # "black", "preserve", "white", "custom"
     "custom_color": "#3B82F6",
-    "white_tolerance": 32,
-    "softness": 3,
-    "ink_boost": 1.4,
+    "sensitivity": 28,            # Background noise threshold
+    "softness": 4,                # Antialiasing transition range
+    "ink_boost": 1.3,             # Ink density boost
     "auto_crop": True
 }
 
@@ -59,14 +60,42 @@ current_settings = load_settings()
 request_show_window = False
 
 # ==========================================
-# MATHEMATICAL MATTING ENGINE
+# MATHEMATICAL MATTING ENGINE (V2)
 # ==========================================
 def hex_to_rgb(hex_str):
     hex_str = hex_str.lstrip('#')
     return tuple(int(hex_str[i:i+2], 16) for i in (0, 2, 4))
 
+def estimate_background_color(arr_rgb, mode="auto"):
+    """
+    Samples perimeter edges (4 borders) using median filtering
+    to extract the true background color B, unaffected by text.
+    """
+    if mode == "white":
+        return np.array([255.0, 255.0, 255.0], dtype=np.float32)
+    elif mode == "dark":
+        return np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
+    h, w = arr_rgb.shape[:2]
+    pad_y = max(1, int(h * 0.035))
+    pad_x = max(1, int(w * 0.035))
+
+    top = arr_rgb[:pad_y, :, :3].reshape(-1, 3)
+    bottom = arr_rgb[-pad_y:, :, :3].reshape(-1, 3)
+    left = arr_rgb[:, :pad_x, :3].reshape(-1, 3)
+    right = arr_rgb[:, -pad_x:, :3].reshape(-1, 3)
+
+    perimeter = np.vstack([top, bottom, left, right])
+    bg_color = np.median(perimeter, axis=0)
+    return bg_color
+
 def process_image(pil_img, cfg):
-    """Executes subpixel Color-to-Alpha vector extraction."""
+    """
+    V2 Continuous Color-to-Alpha Matting Engine
+    - Multi-background support
+    - Soft continuous antialiased alpha
+    - Foreground color decontamination (no white halos)
+    """
     img = pil_img.convert("RGBA")
     arr = np.array(img, dtype=np.float32)
 
@@ -74,59 +103,87 @@ def process_image(pil_img, cfg):
     g = arr[:, :, 1]
     b = arr[:, :, 2]
 
-    # Standard Rec. 709 Luminance
-    lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
-    dist_from_white = 255.0 - lum
+    # 1. Estimate Background Color
+    bg = estimate_background_color(arr, cfg.get("bg_detection_mode", "auto"))
+    bg_r, bg_g, bg_b = bg[0], bg[1], bg[2]
 
-    tol = (float(cfg["white_tolerance"]) / 100.0) * 255.0
-    soft = float(cfg["softness"]) * 3.0
-    boost = float(cfg["ink_boost"])
-    mode = cfg["ink_mode"]
+    # 2. Euclidean Color Distance from Background
+    # Works universally on white, off-white, sepia, chalkboard, and slides
+    diff_r = r - bg_r
+    diff_g = g - bg_g
+    diff_b = b - bg_b
+    dist = np.sqrt(diff_r * diff_r + diff_g * diff_g + diff_b * diff_b)
 
-    # Compute Alpha Channel
-    alpha = np.zeros_like(lum)
-    if soft > 0:
-        ramp = (dist_from_white - (tol - soft)) / (soft * 2.0)
-        alpha = np.clip(ramp * 255.0, 0.0, 255.0)
-    else:
-        alpha = np.where(dist_from_white >= tol, 255.0, 0.0)
+    # 3. Continuous Soft Alpha Calculation
+    sens = float(cfg.get("sensitivity", 28))
+    soft = float(cfg.get("softness", 4))
+    boost = float(cfg.get("ink_boost", 1.3))
+    mode = cfg.get("ink_mode", "black")
+
+    # Dynamic Noise Threshold & Transition Range
+    t_noise = sens * 1.35
+    t_span = soft * 14.0 + 35.0
+    t_solid = t_noise + t_span
+
+    # Continuous alpha ramp (0.0 to 1.0)
+    alpha_norm = np.clip((dist - t_noise) / (t_solid - t_noise), 0.0, 1.0)
+
+    # Gamma curve (0.85) to preserve delicate Hindi matras, accents, and thin strokes
+    alpha_curved = np.power(alpha_norm, 0.85)
+    alpha_255 = alpha_curved * 255.0
 
     out = np.zeros_like(arr, dtype=np.uint8)
-    out[:, :, 3] = alpha.astype(np.uint8)
+    out[:, :, 3] = np.clip(alpha_255, 0, 255).astype(np.uint8)
 
-    # Color Mapping
+    # 4. Color Assignment & Decontamination
     if mode == "black":
         out[:, :, 0] = 0
         out[:, :, 1] = 0
         out[:, :, 2] = 0
+
     elif mode == "white":
         out[:, :, 0] = 255
         out[:, :, 1] = 255
         out[:, :, 2] = 255
+
     elif mode == "custom":
         cr, cg, cb = hex_to_rgb(cfg.get("custom_color", "#3B82F6"))
         out[:, :, 0] = cr
         out[:, :, 1] = cg
         out[:, :, 2] = cb
+
     else:
-        # Preserve original line/river colors with defringing
-        out[:, :, 0] = np.clip(r / boost, 0, 255).astype(np.uint8)
-        out[:, :, 1] = np.clip(g / boost, 0, 255).astype(np.uint8)
-        out[:, :, 2] = np.clip(b / boost, 0, 255).astype(np.uint8)
+        # Preserve Tint Mode: Foreground Decontamination
+        # Formula: F = (C - (1 - alpha) * B) / alpha
+        a_safe = np.clip(alpha_curved, 0.001, 1.0)
+        inv_a = 1.0 - a_safe
+
+        # Decontaminate background color bleeding from edge pixels
+        decontam_r = np.clip((r - inv_a * bg_r) / a_safe, 0.0, 255.0)
+        decontam_g = np.clip((g - inv_a * bg_g) / a_safe, 0.0, 255.0)
+        decontam_b = np.clip((b - inv_a * bg_b) / a_safe, 0.0, 255.0)
+
+        # Apply ink boost
+        out[:, :, 0] = np.clip(decontam_r / boost, 0, 255).astype(np.uint8)
+        out[:, :, 1] = np.clip(decontam_g / boost, 0, 255).astype(np.uint8)
+        out[:, :, 2] = np.clip(decontam_b / boost, 0, 255).astype(np.uint8)
 
     result = Image.fromarray(out, mode="RGBA")
 
-    # Auto Crop Transparent Margins
+    # 5. Low-Alpha-Aware Crop (Leaves padding so thin strokes are never clipped)
     if cfg.get("auto_crop", True):
-        bbox = result.getbbox()
-        if bbox:
+        alpha_mask = out[:, :, 3] > 8
+        coords = np.argwhere(alpha_mask)
+        if len(coords) > 0:
+            y_min, x_min = coords.min(axis=0)
+            y_max, x_max = coords.max(axis=0)
             pad = 6
             w, h = result.size
             crop_box = (
-                max(0, bbox[0] - pad),
-                max(0, bbox[1] - pad),
-                min(w, bbox[2] + pad),
-                min(h, bbox[3] + pad)
+                max(0, x_min - pad),
+                max(0, y_min - pad),
+                min(w, x_max + pad),
+                min(h, y_max + pad)
             )
             result = result.crop(crop_box)
 
@@ -152,7 +209,7 @@ def write_png_to_clipboard(pil_img):
     pil_img.save(buf, format="PNG")
     png_bytes = buf.getvalue()
 
-    # Track hash to prevent infinite loop
+    # Track hash to prevent loop
     last_processed_hash = hashlib.md5(png_bytes).hexdigest()
 
     for _ in range(5):
@@ -198,8 +255,9 @@ def clipboard_listener():
             continue
 
         if current_hash == last_processed_hash:
-            continue  # Ignore our own export
+            continue
 
+        # If already predominantly transparent, ignore
         if img.mode == "RGBA":
             alpha_channel = np.array(img)[:, :, 3]
             if np.mean(alpha_channel < 10) > 0.08:
@@ -255,18 +313,18 @@ def setup_tray(app):
 class SettingsApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Quick Ink Clipper")
-        self.root.geometry("440x600")
-        self.root.minsize(400, 520)
+        self.root.title("Quick Ink Clipper Pro")
+        self.root.geometry("450x640")
+        self.root.minsize(420, 560)
         self.root.configure(bg="#111318")
 
-        self.center_window(440, 600)
+        self.center_window(450, 640)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
         self.build_ui()
         self.sync_ui()
 
-        # Start continuous 50ms heartbeat poll loop
+        # 50ms heartbeat poll to catch tray clicks
         self.poll_tray_requests()
 
     def center_window(self, w, h):
@@ -287,28 +345,27 @@ class SettingsApp:
         self.root.after(50, self.poll_tray_requests)
 
     def build_ui(self):
-        # Outer Container with bright, clear borders
         self.container = tk.Frame(self.root, bg="#111318", padx=16, pady=16)
         self.container.pack(fill="both", expand=True)
 
         # Header Title
         header_frame = tk.Frame(self.container, bg="#111318")
-        header_frame.pack(fill="x", pady=(0, 12))
+        header_frame.pack(fill="x", pady=(0, 10))
 
         tk.Label(
-            header_frame, text="Quick Ink Clipper",
-            font=("Segoe UI", 14, "bold"), bg="#111318", fg="#FFFFFF"
+            header_frame, text="Quick Ink Clipper Pro",
+            font=("Segoe UI", 13, "bold"), bg="#111318", fg="#FFFFFF"
         ).pack(anchor="w")
 
         self.status_lbl = tk.Label(
             header_frame, text="● Active & Monitoring (Win + Shift + S)",
-            font=("Segoe UI", 9, "bold"), bg="#111318", fg="#10B981"
+            font=("Segoe UI", 8, "bold"), bg="#111318", fg="#10B981"
         )
         self.status_lbl.pack(anchor="w", pady=(2, 0))
 
-        # Card 1: Master Controls
-        card1 = tk.Frame(self.container, bg="#1A1D26", padx=14, pady=12, relief="solid", bd=1, highlightbackground="#2D3345")
-        card1.pack(fill="x", pady=(0, 10))
+        # Card 1: Master Toggle
+        card1 = tk.Frame(self.container, bg="#1A1D26", padx=12, pady=10, relief="solid", bd=1, highlightbackground="#2D3345")
+        card1.pack(fill="x", pady=(0, 8))
 
         self.auto_clip_var = tk.BooleanVar(value=current_settings["auto_clip_enabled"])
         chk_clip = tk.Checkbutton(
@@ -326,97 +383,122 @@ class SettingsApp:
             bg="#1A1D26", fg="#94A3B8", selectcolor="#111318", activebackground="#1A1D26", activeforeground="#FFFFFF",
             font=("Segoe UI", 8)
         )
-        chk_sound.pack(anchor="w", pady=(4, 0))
+        chk_sound.pack(anchor="w", pady=(2, 0))
 
-        # Card 2: Ink Output Mode
-        card2 = tk.Frame(self.container, bg="#1A1D26", padx=14, pady=12, relief="solid", bd=1, highlightbackground="#2D3345")
-        card2.pack(fill="x", pady=(0, 10))
+        # Card 2: Background Detection
+        card2 = tk.Frame(self.container, bg="#1A1D26", padx=12, pady=10, relief="solid", bd=1, highlightbackground="#2D3345")
+        card2.pack(fill="x", pady=(0, 8))
 
         tk.Label(
-            card2, text="RENDER INK AS", font=("Segoe UI", 8, "bold"),
-            bg="#1A1D26", fg="#818CF8"
-        ).pack(anchor="w", pady=(0, 6))
+            card2, text="SOURCE BACKGROUND COLOR", font=("Segoe UI", 8, "bold"),
+            bg="#1A1D26", fg="#38BDF8"
+        ).pack(anchor="w", pady=(0, 4))
 
-        self.ink_mode_var = tk.StringVar(value=current_settings["ink_mode"])
-        modes = [
-            ("Pitch Black (Vector Sharp)", "black"),
-            ("Preserve Tint (Keep Grey Rivers / Colors)", "preserve"),
-            ("Crisp White (For Dark Notes)", "white")
+        self.bg_mode_var = tk.StringVar(value=current_settings.get("bg_detection_mode", "auto"))
+        bg_modes = [
+            ("✨ Auto-Detect (Any Color: White, Sepia, Chalkboard, Slide)", "auto"),
+            ("Force Pure White Paper", "white"),
+            ("Force Dark / Blackboard", "dark")
         ]
-        for label, val in modes:
+        for label, val in bg_modes:
             rb = tk.Radiobutton(
-                card2, text=label, value=val, variable=self.ink_mode_var,
+                card2, text=label, value=val, variable=self.bg_mode_var,
                 command=self.on_setting_change, bg="#1A1D26", fg="#E2E8F0",
                 selectcolor="#111318", activebackground="#1A1D26", activeforeground="#FFFFFF",
                 font=("Segoe UI", 8)
             )
-            rb.pack(anchor="w", pady=2)
+            rb.pack(anchor="w", pady=1)
 
-        # Card 3: Precision Tuning Sliders
-        card3 = tk.Frame(self.container, bg="#1A1D26", padx=14, pady=12, relief="solid", bd=1, highlightbackground="#2D3345")
-        card3.pack(fill="x", pady=(0, 10))
+        # Card 3: Ink Output Mode
+        card3 = tk.Frame(self.container, bg="#1A1D26", padx=12, pady=10, relief="solid", bd=1, highlightbackground="#2D3345")
+        card3.pack(fill="x", pady=(0, 8))
 
-        # Slider: Tolerance
-        f_tol = tk.Frame(card3, bg="#1A1D26")
-        f_tol.pack(fill="x")
-        tk.Label(f_tol, text="White Background Cutoff", font=("Segoe UI", 8), bg="#1A1D26", fg="#CBD5E1").pack(side="left")
-        self.tol_val_lbl = tk.Label(f_tol, text=f"{current_settings['white_tolerance']}%", font=("Segoe UI", 8, "bold"), bg="#1A1D26", fg="#38BDF8")
-        self.tol_val_lbl.pack(side="right")
+        tk.Label(
+            card3, text="RENDER INK AS", font=("Segoe UI", 8, "bold"),
+            bg="#1A1D26", fg="#818CF8"
+        ).pack(anchor="w", pady=(0, 4))
 
-        self.tol_scale = tk.Scale(
-            card3, from_=10, to=80, orient="horizontal", bg="#1A1D26", fg="#FFFFFF",
+        self.ink_mode_var = tk.StringVar(value=current_settings["ink_mode"])
+        ink_modes = [
+            ("Pitch Black (Vector Sharp)", "black"),
+            ("Preserve Tint & Rivers (Halo-Free Decontaminated)", "preserve"),
+            ("Crisp White (For Dark Notes)", "white")
+        ]
+        for label, val in ink_modes:
+            rb = tk.Radiobutton(
+                card3, text=label, value=val, variable=self.ink_mode_var,
+                command=self.on_setting_change, bg="#1A1D26", fg="#E2E8F0",
+                selectcolor="#111318", activebackground="#1A1D26", activeforeground="#FFFFFF",
+                font=("Segoe UI", 8)
+            )
+            rb.pack(anchor="w", pady=1)
+
+        # Card 4: Precision Tuning Sliders
+        card4 = tk.Frame(self.container, bg="#1A1D26", padx=12, pady=10, relief="solid", bd=1, highlightbackground="#2D3345")
+        card4.pack(fill="x", pady=(0, 8))
+
+        # Sensitivity / Noise Floor
+        f_sens = tk.Frame(card4, bg="#1A1D26")
+        f_sens.pack(fill="x")
+        tk.Label(f_sens, text="Background Noise Cutoff", font=("Segoe UI", 8), bg="#1A1D26", fg="#CBD5E1").pack(side="left")
+        self.sens_val_lbl = tk.Label(f_sens, text=f"{current_settings['sensitivity']}", font=("Segoe UI", 8, "bold"), bg="#1A1D26", fg="#38BDF8")
+        self.sens_val_lbl.pack(side="right")
+
+        self.sens_scale = tk.Scale(
+            card4, from_=10, to=60, orient="horizontal", bg="#1A1D26", fg="#FFFFFF",
             highlightthickness=0, troughcolor="#2D3345", showvalue=0, command=self.on_slider_change
         )
-        self.tol_scale.set(current_settings["white_tolerance"])
-        self.tol_scale.pack(fill="x", pady=(2, 6))
+        self.sens_scale.set(current_settings["sensitivity"])
+        self.sens_scale.pack(fill="x", pady=(1, 6))
 
-        # Slider: Softness
-        f_soft = tk.Frame(card3, bg="#1A1D26")
+        # Softness
+        f_soft = tk.Frame(card4, bg="#1A1D26")
         f_soft.pack(fill="x")
-        tk.Label(f_soft, text="Edge Softness (Defringe)", font=("Segoe UI", 8), bg="#1A1D26", fg="#CBD5E1").pack(side="left")
+        tk.Label(f_soft, text="Edge Softness (Antialiasing)", font=("Segoe UI", 8), bg="#1A1D26", fg="#CBD5E1").pack(side="left")
         self.soft_val_lbl = tk.Label(f_soft, text=f"{current_settings['softness']}px", font=("Segoe UI", 8, "bold"), bg="#1A1D26", fg="#38BDF8")
         self.soft_val_lbl.pack(side="right")
 
         self.soft_scale = tk.Scale(
-            card3, from_=0, to=12, orient="horizontal", bg="#1A1D26", fg="#FFFFFF",
+            card4, from_=1, to=10, orient="horizontal", bg="#1A1D26", fg="#FFFFFF",
             highlightthickness=0, troughcolor="#2D3345", showvalue=0, command=self.on_slider_change
         )
         self.soft_scale.set(current_settings["softness"])
-        self.soft_scale.pack(fill="x", pady=(2, 6))
+        self.soft_scale.pack(fill="x", pady=(1, 4))
 
-        # Checkbox: Auto Crop
+        # Auto Crop
         self.crop_var = tk.BooleanVar(value=current_settings["auto_crop"])
         chk_crop = tk.Checkbutton(
-            card3, text="Auto-Trim Empty Margins (Tight Sticker)",
+            card4, text="Auto-Trim Empty Margins (Tight Sticker)",
             variable=self.crop_var, command=self.on_setting_change,
             bg="#1A1D26", fg="#E2E8F0", selectcolor="#111318", activebackground="#1A1D26", activeforeground="#FFFFFF",
             font=("Segoe UI", 8)
         )
-        chk_crop.pack(anchor="w", pady=(4, 0))
+        chk_crop.pack(anchor="w", pady=(3, 0))
 
         # Hide to Tray Action Button
         btn_hide = tk.Button(
             self.container, text="✓ Save & Minimize to Taskbar Tray", command=self.hide_window,
             bg="#2563EB", fg="#FFFFFF", activebackground="#1D4ED8", activeforeground="#FFFFFF",
-            relief="flat", font=("Segoe UI", 9, "bold"), pady=8, cursor="hand2"
+            relief="flat", font=("Segoe UI", 9, "bold"), pady=6, cursor="hand2"
         )
         btn_hide.pack(fill="x", pady=(6, 0))
 
     def on_setting_change(self):
         current_settings["auto_clip_enabled"] = self.auto_clip_var.get()
         current_settings["play_sound"] = self.sound_var.get()
+        current_settings["bg_detection_mode"] = self.bg_mode_var.get()
         current_settings["ink_mode"] = self.ink_mode_var.get()
         current_settings["auto_crop"] = self.crop_var.get()
         save_settings(current_settings)
         self.sync_ui()
 
     def on_slider_change(self, _=None):
-        if not hasattr(self, 'tol_scale') or not hasattr(self, 'soft_scale'):
+        if not hasattr(self, 'sens_scale') or not hasattr(self, 'soft_scale'):
             return
-        current_settings["white_tolerance"] = self.tol_scale.get()
+        current_settings["sensitivity"] = self.sens_scale.get()
         current_settings["softness"] = self.soft_scale.get()
-        if hasattr(self, 'tol_val_lbl'):
-            self.tol_val_lbl.config(text=f"{self.tol_scale.get()}%")
+        if hasattr(self, 'sens_val_lbl'):
+            self.sens_val_lbl.config(text=f"{self.sens_scale.get()}")
         if hasattr(self, 'soft_val_lbl'):
             self.soft_val_lbl.config(text=f"{self.soft_scale.get()}px")
         save_settings(current_settings)
@@ -436,7 +518,6 @@ class SettingsApp:
         self.root.state('normal')
         self.root.lift()
         self.root.focus_force()
-        # Force Windows to repaint the window canvas and children immediately
         self.root.update_idletasks()
         self.root.update()
 
@@ -451,7 +532,5 @@ if __name__ == "__main__":
     app = SettingsApp(root)
     setup_tray(app)
 
-    # Force initial display
     app.show_window()
-
     root.mainloop()
